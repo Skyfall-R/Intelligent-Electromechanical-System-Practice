@@ -131,13 +131,22 @@ def parse_line(line: str):
 
 # 遥测字段顺序，必须和 debug_link.c 的 DebugLink_SendTelem 一致
 TELEM_FIELDS = [
-    "ms", "v_lf", "v_lb", "v_rf", "v_rb", "yaw_c",
+    "ms",
+    "cnt_lf", "cnt_lb", "cnt_rf", "cnt_rb",       # 每 12 ms 的编码器计数
+    "duty_lf", "duty_lb", "duty_rf", "duty_rb",   # PWM 占空 0~100
+    "yaw_c",
     "vis_class", "vis_bear_c", "vis_dist", "vis_conf", "vision_lost",
     "tof0", "tof1", "tof2",
     "intake", "state", "n_col", "fault",
-    "cmd_vx", "cmd_vy", "cmd_w_c",
+    "cmd_code",
     "srv0", "srv1", "srv2", "mode",
 ]
+
+# 数字动作码，必须和 firmware/Core/Inc/motion.h 一致
+CODE_BRAKE, CODE_FWD, CODE_LEFT, CODE_RIGHT, CODE_TURN_L, CODE_TURN_R = range(6)
+CODE_NAMES = {
+    0: "刹车", 1: "直行", 2: "左移", 3: "右移", 4: "左转", 5: "右转",
+}
 
 STATE_NAMES = {
     0: "—", 1: "初始化与标定", 2: "覆盖搜索", 3: "视觉伺服接近", 4: "扫入收集",
@@ -152,18 +161,27 @@ FAULT_BITS = [
 ]
 
 PARAM_DESC = {
-    "KP_V": "轮速环 P  ×1000",      "KI_V": "轮速环 I  ×1000",
-    "KD_V": "轮速环 D  ×1000",      "KP_W": "航向环 P  ×1000",
-    "KI_W": "航向环 I  ×1000",      "KD_W": "航向环 D  ×1000",
-    "KP_VIS": "视觉伺服 P ×1000",   "KD_VIS": "视觉伺服 D ×1000",
-    "V_MAX": "速度限幅  mm/s",      "VY_MAX": "横移限幅  mm/s",
-    "W_MAX": "角速度限幅 ×100°/s",  "V_CRUISE": "巡航速度  mm/s",
-    "V_NEAR": "近距段速度 mm/s",    "D_NEAR_MM": "远/近分界 mm",
-    "D_BLIND_MM": "拨轮盲区 mm",    "ALIGN_TOL_C": "对准阈值 ×100°",
-    "WALL_TRIG_MM": "碰壁触发 mm",  "ROW_PITCH_MM": "弓字形行距 mm",
-    "WHEEL_L_MM": "麦轮 L (半轴距+半轮距)", "WHEEL_R_MM": "轮半径 ×100 mm",
-    "ENC_PPR": "编码器 PPR (四倍频)", "KNOB_SPD": "拨轮工作转速",
+    "SPD_TARGET": "闭环目标 计数/12ms",
+    "SPD_STEP": "占空比每 tick 增量",
+    "D_NEAR_MM": "远/近分界 mm",
+    "D_BLIND_MM": "拨轮盲区 mm",
+    "ALIGN_TOL_C": "对准阈值 ×100°",
+    "WALL_TRIG_MM": "碰壁触发 mm",
+    "ROW_PITCH_MM": "弓字形行距 mm",
+    "WHEEL_L_MM": "半轴距+半轮距 mm",
+    "WHEEL_R_MM": "轮半径 ×100 mm",
+    "ENC_PPR": "编码器 PPR (四倍频)",
+    "KNOB_SPD": "拨轮工作转速",
     "TELEM_HZ": "遥测频率 Hz",
+}
+
+
+# DEMO 模式下的参数初值，与 debug_link.c 的 s_params[] 一致
+PARAM_DEMO = {
+    "SPD_TARGET": 11, "SPD_STEP": 1, "D_NEAR_MM": 490, "D_BLIND_MM": 326,
+    "ALIGN_TOL_C": 100, "WALL_TRIG_MM": 300, "ROW_PITCH_MM": 1000,
+    "WHEEL_L_MM": 150, "WHEEL_R_MM": 3750, "ENC_PPR": 1560,
+    "KNOB_SPD": 500, "TELEM_HZ": 20,
 }
 
 
@@ -239,26 +257,40 @@ class DemoWorker(QThread):
     def __init__(self):
         super().__init__()
         self._run = True
-        self.cmd = [0, 0, 0]
+        self.code = 0
+        self.target = 11
         self.mode = 0
 
     def run(self):
         self.opened.emit(True, "DEMO")
         t0 = time.time()
-        vs = [0.0] * 4
+        cnt  = [0.0] * 4
+        duty = [0.0] * 4
+        # 与 motion.c 的 WHEEL_DIR 一致
+        DIRS = ((0, 0, 0, 0), (1, 1, 1, 1), (-1, 1, 1, -1),
+                (1, -1, -1, 1), (-1, -1, 1, 1), (1, 1, -1, -1))
         while self._run:
             t = time.time() - t0
-            tgt = [self.cmd[0]] * 4
+            d = DIRS[self.code if 0 <= self.code < 6 else 0]
             for i in range(4):
-                vs[i] += (tgt[i] - vs[i]) * 0.16 + random.gauss(0, 1.1)
+                if d[i] == 0:
+                    duty[i] = 0.0
+                    cnt[i] += (0 - cnt[i]) * 0.5
+                else:
+                    # 粗略模拟那个 ±1 积分律：占空比追目标，计数跟着占空比走
+                    err = self.target - cnt[i]
+                    duty[i] = max(0.0, min(100.0, duty[i] + (1 if err > 0 else -1)))
+                    cnt[i] += (duty[i] * self.target / 55.0 - cnt[i]) * 0.35
+                    cnt[i] += random.gauss(0, 0.35)
             body = ",".join(str(x) for x in [
                 "T", int(t * 1000),
-                int(vs[0]), int(vs[1]), int(vs[2]), int(vs[3]),
+                *(int(round(cnt[i])) for i in range(4)),
+                *(int(duty[i]) for i in range(4)),
                 int(600 * math.sin(t / 4)),
                 1, int(3000 * math.sin(t / 3)), int(600 + 300 * math.sin(t / 5)), 88, 0,
                 int(1500 + 400 * math.sin(t / 6)), int(800 + 200 * math.cos(t / 4)), 0,
                 0, 2, int(t / 10) % 11, 0,
-                self.cmd[0], self.cmd[1], self.cmd[2],
+                self.code,
                 0, 0, 0, self.mode,
             ])
             self.line_received.emit(f"{body}*{xor_of(body):02X}")
@@ -271,20 +303,26 @@ class DemoWorker(QThread):
         if not p:
             return
         typ, f = p
-        if typ == "S":
-            self.cmd = [int(f[0]), int(f[1]), int(f[2])]
-            self.mode = 1
+        if typ == "N":
+            c = int(f[0])
+            if 0 <= c <= 5:
+                self.code = c
+                self.mode = 1
         elif typ == "A":
-            self.mode = 0; self.cmd = [0, 0, 0]
+            self.mode = 0; self.code = 0
         elif typ == "E":
-            self.mode = 2; self.cmd = [0, 0, 0]
+            self.mode = 2; self.code = 0
         elif typ == "Q":
-            self.line_received.emit("V,DEMO,2,72000000" + f"*{xor_of('V,DEMO,2,72000000'):02X}")
-            for n, d in PARAM_DESC.items():
-                b = f"K,{n},{random.randint(0, 2000)}"
+            self.line_received.emit("V,DEMO,3,72000000" + f"*{xor_of('V,DEMO,3,72000000'):02X}")
+            for n, v in PARAM_DEMO.items():
+                b = f"K,{n},{v}"
                 self.line_received.emit(f"{b}*{xor_of(b):02X}")
         elif typ == "P":
-            b = f"K,{f[0]},{f[1]}"
+            if f[0] == "SPD_TARGET":
+                self.target = max(1, min(500, int(f[1])))
+                b = f"K,SPD_TARGET,{self.target}"
+            else:
+                b = f"K,{f[0]},{f[1]}"
             self.line_received.emit(f"{b}*{xor_of(b):02X}")
 
     def stop(self):
@@ -419,18 +457,20 @@ class Console(QMainWindow):
         N = 1400
         self.t_buf = deque(maxlen=N)
         self.series = {k: deque(maxlen=N) for k in
-                       ["v_lf", "v_lb", "v_rf", "v_rb",
+                       ["cnt_lf", "cnt_lb", "cnt_rf", "cnt_rb",
+                        "duty_lf", "duty_lb", "duty_rf", "duty_rb",
                         "vis_bear_deg", "vis_dist", "tof0", "tof1", "tof2",
-                        "cmd_vx", "cmd_vy", "cmd_w_deg", "yaw_deg"]}
+                        "cmd_code", "yaw_deg", "spd_target"]}
         self.t0 = None
         self._last_ms = 0
 
         # 遥控状态
         self.remote_on = False
         self.keys: set[int] = set()
-        self.v_step = 200          # mm/s
-        self.w_step = 6000         # ×100 °/s = 60 °/s
-        self.btn_axis = [0, 0, 0]  # 鼠标按钮产生的分量
+        self.btn_code = None       # 鼠标按住某个动作按钮
+        self.key_order: list[int] = []
+        self.tx_code  = 0          # 当前正在下发的动作码
+        self.spd_target = 11       # 从 K,SPD_TARGET 回读，画在曲线上做参考线
 
         # 统计
         self.n_frames = 0
@@ -449,6 +489,11 @@ class Console(QMainWindow):
         self.ui_timer = QTimer(self); self.ui_timer.timeout.connect(self._ui_tick)
         self.ui_timer.start(80)
 
+        self.KEY_CODE = {
+            Qt.Key_W: CODE_FWD,    Qt.Key_S: CODE_BRAKE,
+            Qt.Key_A: CODE_LEFT,   Qt.Key_D: CODE_RIGHT,
+            Qt.Key_Q: CODE_TURN_L, Qt.Key_E: CODE_TURN_R,
+        }
         self.setFocusPolicy(Qt.StrongFocus)
         if demo:
             QTimer.singleShot(200, self.toggle_conn)
@@ -577,37 +622,31 @@ class Console(QMainWindow):
         row.addWidget(self.btn_auto)
         rl.addLayout(row)
 
-        sp = QHBoxLayout()
-        sp.addWidget(QLabel("速度档"))
-        self.sl_v = QSlider(Qt.Horizontal); self.sl_v.setRange(50, 600)
-        self.sl_v.setValue(self.v_step)
-        self.lb_v = QLabel(f"{self.v_step} mm/s")
-        self.lb_v.setObjectName("vnum")
-        self.lb_v.setMinimumWidth(110)
-        self.sl_v.valueChanged.connect(
-            lambda v: (setattr(self, "v_step", v), self.lb_v.setText(f"{v} mm/s")))
-        sp.addWidget(self.sl_v); sp.addWidget(self.lb_v)
-        rl.addLayout(sp)
-
-        # 方向按钮阵列
+        # 六个动作按钮：按住生效，松开回 00 刹车
         grid = QGridLayout(); grid.setSpacing(5)
-        mk = lambda txt, ax, val: HoldButton(
-            txt, lambda: self._btn(ax, val), lambda: self._btn(ax, 0))
-        grid.addWidget(mk("↖\nQ", 2, +1), 0, 0)
-        grid.addWidget(mk("↑\nW", 0, +1), 0, 1)
-        grid.addWidget(mk("↗\nE", 2, -1), 0, 2)
-        grid.addWidget(mk("←\nA", 1, +1), 1, 0)
-        grid.addWidget(mk("↓\nS", 0, -1), 1, 1)
-        grid.addWidget(mk("→\nD", 1, -1), 1, 2)
+        mk = lambda txt, code: HoldButton(
+            txt, lambda: self._hold(code), lambda: self._hold(None))
+        grid.addWidget(mk("↖\nQ 左转", CODE_TURN_L), 0, 0)
+        grid.addWidget(mk("↑\nW 直行", CODE_FWD),    0, 1)
+        grid.addWidget(mk("↗\nE 右转", CODE_TURN_R), 0, 2)
+        grid.addWidget(mk("←\nA 左移", CODE_LEFT),   1, 0)
+        grid.addWidget(mk("■\nS 刹车", CODE_BRAKE),  1, 1)
+        grid.addWidget(mk("→\nD 右移", CODE_RIGHT),  1, 2)
         wrap = QWidget(); wrap.setLayout(grid)
         wrap.setStyleSheet("background:transparent;")
         rl.addWidget(wrap, 0, Qt.AlignHCenter)
 
-        hint = QLabel("W/S 前后 · A/D 横移 · Q/E 转向\n先点「接管遥控」，键盘才生效")
+        hint = QLabel("W 直行 · A/D 左右横移 · Q/E 原地转 · S 刹车\n"
+                      "先点「接管遥控」，键盘才生效")
         hint.setObjectName("hint"); hint.setAlignment(Qt.AlignCenter)
         rl.addWidget(hint)
 
-        self.st_cmd = Stat("当前指令", "0, 0, 0")
+        self.lb_txcode = QLabel("下发 00 · 刹车")
+        self.lb_txcode.setObjectName("hint")
+        self.lb_txcode.setAlignment(Qt.AlignCenter)
+        rl.addWidget(self.lb_txcode)
+
+        self.st_cmd = Stat("固件回报", "0 · 刹车")
         rl.addWidget(self.st_cmd)
         left.addWidget(c_rc)
 
@@ -649,8 +688,13 @@ class Console(QMainWindow):
             cap = QLabel(ylabel); cap.setObjectName("plotcap")
             hdr.addWidget(cap); hdr.addStretch(1)
             for i, (k, lb) in enumerate(zip(keys, labels)):
-                col = SERIES_COLORS[i % len(SERIES_COLORS)]
-                self.curves[k] = p.plot([], [], pen=pg.mkPen(col, width=2.2), name=lb)
+                if k == "spd_target":           # 目标值画成灰色虚线参考线
+                    col = C_DIM
+                    pen = pg.mkPen(col, width=1.6, style=Qt.DashLine)
+                else:
+                    col = SERIES_COLORS[i % len(SERIES_COLORS)]
+                    pen = pg.mkPen(col, width=2.2)
+                self.curves[k] = p.plot([], [], pen=pen, name=lb)
                 hdr.addWidget(LegendChip(col, lb))
 
             box = QWidget()
@@ -659,9 +703,15 @@ class Console(QMainWindow):
             self.plots[name] = p
             return box
 
-        self.tabs.addTab(new_plot("wheel", "轮速 mm/s",
-                                  ["v_lf", "v_lb", "v_rf", "v_rb"],
-                                  ["左前", "左后", "右前", "右后"], span=100.0), "轮速")
+        self.tabs.addTab(new_plot("wheel", "四轮计数 / 12 ms",
+                                  ["cnt_lf", "cnt_lb", "cnt_rf", "cnt_rb", "spd_target"],
+                                  ["左前", "左后", "右前", "右后", "目标"],
+                                  span=30.0), "轮速")
+
+        self.tabs.addTab(new_plot("duty", "PWM 占空 %",
+                                  ["duty_lf", "duty_lb", "duty_rf", "duty_rb"],
+                                  ["左前", "左后", "右前", "右后"],
+                                  span=100.0), "占空比")
 
         w_vis = QWidget(); lv = QVBoxLayout(w_vis); lv.setContentsMargins(0, 0, 0, 0); lv.setSpacing(6)
         lv.addWidget(new_plot("vis_a", "角度 °", ["vis_bear_deg", "yaw_deg"],
@@ -670,8 +720,13 @@ class Console(QMainWindow):
                               ["视觉距离", "ToF①", "ToF②", "ToF③"], span=200.0))
         self.tabs.addTab(w_vis, "视觉 / 测距")
 
-        self.tabs.addTab(new_plot("cmd", "下发指令", ["cmd_vx", "cmd_vy", "cmd_w_deg"],
-                                  ["vx mm/s", "vy mm/s", "w °/s"], span=100.0), "指令")
+        w_cmd = new_plot("cmd", "当前动作码", ["cmd_code"], ["动作"], span=6.0)
+        self.plots["cmd"].getAxis("left").setTicks(
+            [[(k, f"{k} {v}") for k, v in CODE_NAMES.items()]])
+        for _e in self._plot_list:
+            if _e["p"] is self.plots["cmd"]:
+                _e["yfix"] = (-0.4, 5.4)
+        self.tabs.addTab(w_cmd, "指令")
         self.tabs.setMinimumHeight(220)
         self.rsplit.addWidget(self.tabs)
 
@@ -885,6 +940,11 @@ class Console(QMainWindow):
             self.on_telem(f)
         elif typ == "K" and len(f) >= 2:
             self.set_param_row(f[0], f[1])
+            if f[0] == "SPD_TARGET":
+                try:
+                    self.spd_target = int(f[1])
+                except ValueError:
+                    pass
         elif typ == "L":
             self.logp("固件：" + ",".join(f), C_WARN)
         elif typ == "V":
@@ -915,13 +975,14 @@ class Console(QMainWindow):
         t = (ms - self.t0) / 1000.0
 
         self.t_buf.append(t)
-        for k in ("v_lf", "v_lb", "v_rf", "v_rb", "cmd_vx", "cmd_vy",
-                  "tof0", "tof1", "tof2"):
+        for k in ("cnt_lf", "cnt_lb", "cnt_rf", "cnt_rb",
+                  "duty_lf", "duty_lb", "duty_rf", "duty_rb",
+                  "cmd_code", "tof0", "tof1", "tof2"):
             self.series[k].append(d[k])
         self.series["vis_bear_deg"].append(d["vis_bear_c"] / 100.0)
         self.series["yaw_deg"].append(d["yaw_c"] / 100.0)
-        self.series["cmd_w_deg"].append(d["cmd_w_c"] / 100.0)
         self.series["vis_dist"].append(0 if d["vis_dist"] == 65535 else d["vis_dist"])
+        self.series["spd_target"].append(self.spd_target)
 
         self.last = d
         if self.csv_w:
@@ -976,6 +1037,9 @@ class Console(QMainWindow):
                     hi = b if hi is None else max(hi, b)
                 if lo is None:
                     continue
+                if e.get("yfix"):                # 动作码这种离散量，量程写死
+                    e["p"].setYRange(e["yfix"][0], e["yfix"][1], padding=0.0)
+                    continue
                 span = e["span"]
                 if hi - lo < span:               # 只有噪声时别把量程放大到 ±3
                     c = (hi + lo) / 2.0
@@ -996,39 +1060,45 @@ class Console(QMainWindow):
         self.st_dist.set("—" if d["vis_dist"] == 65535 else f'{d["vis_dist"]} mm')
         self.st_up.set(f'{d["ms"]/1000:.0f} s')
         self.leds.update_bits(d["fault"])
-        self.st_cmd.set(f'{d["cmd_vx"]}, {d["cmd_vy"]}, {d["cmd_w_c"]/100:.0f}°/s')
+        cc = d["cmd_code"]
+        self.st_cmd.set(f'{cc} · {CODE_NAMES.get(cc, "?")}',
+                        C_DIM if cc == 0 else C_WARN)
 
     # ─────────────────────── 遥控 ───────────────────────
     def set_remote(self, on: bool):
         self.remote_on = on
         self.btn_take.setText("● 遥控中" if on else "接管遥控")
         if not on:
-            self.keys.clear(); self.btn_axis = [0, 0, 0]
+            self.keys.clear(); self.btn_code = None
             self.send_auto()
         else:
-            self.logp("已接管遥控：松开所有键 200 ms 主控会自动归零", C_WARN)
+            self.logp("已接管遥控：松开所有键会发 N,00 刹车；"
+                      "完全断联 200 ms 主控也会自动刹车", C_WARN)
         self.setFocus()
 
-    def _btn(self, axis: int, val: int):
-        self.btn_axis[axis] = val
+    def _hold(self, code):
+        """鼠标按住动作按钮 = 该动作；松开 = 回刹车"""
+        self.btn_code = code
 
-    def _axes(self):
-        vx = vy = w = 0
-        if Qt.Key_W in self.keys: vx += 1
-        if Qt.Key_S in self.keys: vx -= 1
-        if Qt.Key_A in self.keys: vy += 1
-        if Qt.Key_D in self.keys: vy -= 1
-        if Qt.Key_Q in self.keys: w  += 1
-        if Qt.Key_E in self.keys: w  -= 1
-        vx += self.btn_axis[0]; vy += self.btn_axis[1]; w += self.btn_axis[2]
-        clamp = lambda x: max(-1, min(1, x))
-        return clamp(vx), clamp(vy), clamp(w)
+    KEY_CODE = None      # 在 __init__ 之后由 _init_keymap 填，避免类体里引用 Qt
+
+    def _wanted_code(self) -> int:
+        """键盘 + 鼠标合成出当前该发的动作码。多个键同时按时取后按下的那个。"""
+        if self.btn_code is not None:
+            return self.btn_code
+        for k in reversed(self.key_order):
+            if k in self.keys:
+                return self.KEY_CODE[k]
+        return CODE_BRAKE
 
     def _tx_tick(self):
         if not (self.worker and self.remote_on):
             return
-        ax, ay, aw = self._axes()
-        self.tx(f"S,{ax*self.v_step},{ay*self.v_step},{aw*self.w_step}")
+        code = self._wanted_code()
+        self.tx(f"N,{code:02d}")
+        if code != self.tx_code:
+            self.tx_code = code
+            self.lb_txcode.setText(f"下发 {code:02d} · {CODE_NAMES[code]}")
 
     def keyPressEvent(self, e: QKeyEvent):
         if e.isAutoRepeat():
@@ -1038,14 +1108,17 @@ class Console(QMainWindow):
             self.send_estop(); return
         if k == Qt.Key_Escape:
             self.btn_take.setChecked(False); return
-        if self.remote_on:
+        if self.remote_on and k in self.KEY_CODE:
             self.keys.add(k)
+            self.key_order.append(k)
         super().keyPressEvent(e)
 
     def keyReleaseEvent(self, e: QKeyEvent):
         if e.isAutoRepeat():
             return
-        self.keys.discard(e.key())
+        k = e.key()
+        self.keys.discard(k)
+        self.key_order = [x for x in self.key_order if x != k]
         super().keyReleaseEvent(e)
 
     def send_estop(self):

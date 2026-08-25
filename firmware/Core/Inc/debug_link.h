@@ -2,7 +2,7 @@
   ******************************************************************************
   * @file    debug_link.h
   * @brief   主控 ↔ 上位机 调试链路（蓝牙 HC-05）
-  *          协议见 算法开发/02-调试协议.md  v2
+  *          协议见 docs/02-调试协议.md  v3
   *
   *  设计要点
   *   · 与具体串口无关：Init 时传 UART 句柄，PD5/PD6(USART2) 或 PC12/PD2(UART5) 都能用
@@ -24,25 +24,14 @@ extern "C" {
  * 增删参数只改这里和 debug_link.c 里的 s_params[]，两处顺序必须一致
  */
 typedef enum {
-    P_KP_V = 0,      /* 轮速环 P   ×1000 */
-    P_KI_V,          /* 轮速环 I   ×1000 */
-    P_KD_V,          /* 轮速环 D   ×1000 */
-    P_KP_W,          /* 航向环 P   ×1000 */
-    P_KI_W,          /* 航向环 I   ×1000 */
-    P_KD_W,          /* 航向环 D   ×1000 */
-    P_KP_VIS,        /* 视觉伺服 P ×1000 */
-    P_KD_VIS,        /* 视觉伺服 D ×1000 */
-    P_V_MAX,         /* 速度限幅   mm/s   */
-    P_VY_MAX,        /* 横移限幅   mm/s   */
-    P_W_MAX,         /* 角速度限幅 ×100 °/s */
-    P_V_CRUISE,      /* 巡航速度   mm/s   */
-    P_V_NEAR,        /* 近距段速度 mm/s   */
+    P_SPD_TARGET = 0,/* 闭环目标：每 tick 的编码器计数（默认 11，即原 main.c 写死的值） */
+    P_SPD_STEP,      /* 占空比每 tick 的调整量（默认 1，即原 main.c 的 ++/--） */
     P_D_NEAR_MM,     /* 远/近分界（车体中心基准） */
     P_D_BLIND_MM,    /* 拨轮遮挡盲区 */
-    P_ALIGN_TOL_C,   /* 对准阈值 ×100 度 */
+    P_ALIGN_TOL_C,   /* 对准阈值 ×100 度：方位角小于它就认为对准，停止转 */
     P_WALL_TRIG_MM,  /* 碰壁换行触发距离 */
     P_ROW_PITCH_MM,  /* 弓字形行距 */
-    P_WHEEL_L_MM,    /* 麦轮逆运动学的 L（半轴距+半轮距） */
+    P_WHEEL_L_MM,    /* 半轴距+半轮距，里程推算用 */
     P_WHEEL_R_MM,    /* 轮半径 ×100 mm（Φ75 → 3750） */
     P_ENC_PPR,       /* 编码器一圈脉冲数（四倍频后） */
     P_KNOB_SPD,      /* 拨轮舵机工作转速 */
@@ -54,7 +43,11 @@ typedef enum {
  * 主控每个遥测周期把当前状态填进来，DebugLink 负责打包发送
  */
 typedef struct {
-    int16_t  v_lf, v_lb, v_rf, v_rb;  /* 四轮实测速度 mm/s  左前/左后/右前/右后 */
+    /* 四轮实测：每个 motion tick(12ms) 的编码器计数，已折算成「期望方向为正」。
+     * 注意单位不是 mm/s —— 闭环控的就是这个计数，调试时和 SPD_TARGET 直接对照 */
+    int16_t  cnt_lf, cnt_lb, cnt_rf, cnt_rb;
+    uint8_t  duty[4];                 /* 四轮当前 PWM 占空 0~100，顺序同上 */
+
     int16_t  yaw_c;                   /* IMU 航向 ×100 度 */
 
     uint8_t  vis_class;               /* 0无 1红方块 2黄圆柱 3目标区 */
@@ -70,7 +63,7 @@ typedef struct {
     uint8_t  n_col;                   /* 已收数量 */
     uint8_t  fault;                   /* 故障位，见 02-调试协议.md §8 */
 
-    int16_t  cmd_vx, cmd_vy, cmd_w_c; /* 当前实际下发的三自由度指令 */
+    uint8_t  cmd_code;                /* 当前生效的动作码 0~5，见 motion.h */
     int16_t  srv[3];                  /* 舵机当前值 0导轨 1拨轮 2推杆 */
 } dbg_telem_t;
 
@@ -85,7 +78,7 @@ typedef enum {
 typedef struct {
     dbg_mode_t mode;
 
-    int16_t  vx, vy, w_c;        /* 遥控三自由度。MANUAL 之外无意义 */
+    uint8_t  code;               /* 遥控动作码 0~5。MANUAL 之外无意义 */
 
     int16_t  servo[3];           /* 舵机目标值 0导轨 1拨轮 2推杆 */
     uint8_t  servo_new;          /* bit0~2：对应舵机有新命令，主控处理完自行清零 */
@@ -93,6 +86,10 @@ typedef struct {
     uint8_t  force_state;        /* 1~10 = 上位机要求切到该状态；0 = 无请求，主控处理完清零 */
     uint8_t  vis_mode;           /* 0~3 = 上位机指定的视觉模式；0xFF = 无请求 */
 } dbg_ctrl_t;
+
+/* 合法动作码上限。debug_link 不关心码的含义，只做范围校验；
+ * 如果 motion.h 里加了新动作（比如 06 后退），这里要跟着改 */
+#define DBG_CODE_MAX  5
 
 /* ========================= 故障位 ========================= */
 #define DBG_FAULT_STALL      (1u << 0)  /* 电机堵转 */

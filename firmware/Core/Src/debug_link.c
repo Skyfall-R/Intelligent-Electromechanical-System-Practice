@@ -2,7 +2,7 @@
   ******************************************************************************
   * @file    debug_link.c
   * @brief   主控 ↔ 上位机 调试链路实现
-  *          协议见 算法开发/02-调试协议.md  v2
+  *          协议见 docs/02-调试协议.md  v3
   ******************************************************************************
   */
 #include "debug_link.h"
@@ -33,7 +33,7 @@ static char     s_tx[TXBUF_SIZE];
 
 static dbg_ctrl_t s_ctrl;
 static dbg_stat_t s_stat;
-static uint32_t   s_last_rc_ms = 0;          /* 上次收到 S 或 H 的时刻 */
+static uint32_t   s_last_rc_ms = 0;          /* 上次收到 N 或 H 的时刻 */
 static uint8_t    s_link_fault = 0;
 
 /* ---- 参数表：顺序必须和 debug_link.h 里的枚举一致 ---- */
@@ -41,19 +41,8 @@ typedef struct { const char *name; int32_t val; int32_t lo; int32_t hi; } param_
 
 static param_t s_params[P_COUNT] = {
     /*  name              初值      下限      上限   */
-    { "KP_V",            1000,        0,   100000 },
-    { "KI_V",              50,        0,   100000 },
-    { "KD_V",               0,        0,   100000 },
-    { "KP_W",            1000,        0,   100000 },
-    { "KI_W",               0,        0,   100000 },
-    { "KD_W",               0,        0,   100000 },
-    { "KP_VIS",          1000,        0,   100000 },
-    { "KD_VIS",             0,        0,   100000 },
-    { "V_MAX",            600,        0,     2000 },
-    { "VY_MAX",           600,        0,     2000 },
-    { "W_MAX",          18000,        0,    36000 },
-    { "V_CRUISE",         200,        0,     2000 },
-    { "V_NEAR",           120,        0,     2000 },
+    { "SPD_TARGET",        11,        1,      500 },
+    { "SPD_STEP",           1,        1,       20 },
     { "D_NEAR_MM",        490,        0,     5000 },
     { "D_BLIND_MM",       326,        0,     5000 },
     { "ALIGN_TOL_C",      100,        1,     6000 },
@@ -65,6 +54,7 @@ static param_t s_params[P_COUNT] = {
     { "KNOB_SPD",         500,    -1000,     1000 },
     { "TELEM_HZ",          20,        1,       50 },
 };
+
 
 /* ===================== 小工具 ===================== */
 
@@ -126,7 +116,7 @@ static void send_param(dbg_param_id_t id)
 static void send_version(void)
 {
     char b[64];
-    int n = snprintf(b, sizeof(b), "V,0.1.0,2,%lu",
+    int n = snprintf(b, sizeof(b), "V,0.2.0,3,%lu",
                      (unsigned long)HAL_RCC_GetSysClockFreq());
     if (n > 0) send_line(b, (uint16_t)n);
 }
@@ -135,7 +125,7 @@ static void set_mode(dbg_mode_t m)
 {
     if (s_ctrl.mode == m) return;
     s_ctrl.mode = m;
-    if (m != DBG_MANUAL) { s_ctrl.vx = s_ctrl.vy = s_ctrl.w_c = 0; }
+    if (m != DBG_MANUAL) { s_ctrl.code = 0; }   /* 退出遥控先归到 00 刹车 */
     DebugLink_Log(m == DBG_AUTO   ? "MODE AUTO"
                 : m == DBG_MANUAL ? "MODE MANUAL"
                                   : "MODE ESTOP");
@@ -165,20 +155,17 @@ static void handle_line(char *line, uint16_t len)
 
     switch (c)
     {
-    /* ---- S,vx,vy,w  三自由度遥控 ---- */
-    case 'S': {
-        if (nf != 4) { s_stat.line_bad_fmt++; DebugLink_Log("BAD FMT S"); return; }
-        long vx = strtol(f[1], NULL, 10);
-        long vy = strtol(f[2], NULL, 10);
-        long w  = strtol(f[3], NULL, 10);
-        /* 越界整行丢弃，不钳到边界——数值离谱本身说明数据有问题 */
-        if (vx < -600 || vx > 600 || vy < -600 || vy > 600 || w < -18000 || w > 18000) {
+    /* ---- N,code  数字动作指令 ---- */
+    case 'N': {
+        if (nf != 2) { s_stat.line_bad_fmt++; DebugLink_Log("BAD FMT N"); return; }
+        /* "01" 和 "1" 都收；strtol 用十进制，前导 0 不会被当成八进制 */
+        long code = strtol(f[1], NULL, 10);
+        /* 越界整行丢弃，不钳到 0——把一个看不懂的码悄悄变成刹车会掩盖上位机的 bug */
+        if (code < 0 || code > DBG_CODE_MAX) {
             s_stat.line_bad_fmt++; DebugLink_Log("BAD RANGE"); return;
         }
         if (s_ctrl.mode != DBG_MANUAL) set_mode(DBG_MANUAL);
-        s_ctrl.vx  = (int16_t)vx;
-        s_ctrl.vy  = (int16_t)vy;
-        s_ctrl.w_c = (int16_t)w;
+        s_ctrl.code  = (uint8_t)code;
         s_last_rc_ms = HAL_GetTick();
         break;
     }
@@ -244,6 +231,7 @@ static void handle_line(char *line, uint16_t len)
     /* ---- E  急停 ---- */
     case 'E':
         set_mode(DBG_ESTOP);
+        s_ctrl.code = 0;                         /* 00 刹车 */
         s_ctrl.servo[0] = s_ctrl.servo[1] = s_ctrl.servo[2] = 0;
         s_ctrl.servo_new = 0x07;
         break;
@@ -346,12 +334,12 @@ void DebugLink_Poll(void)
         }
     }
 
-    /* 2. 遥控心跳超时：200 ms 没消息就把速度全部归零 */
+    /* 2. 遥控心跳超时：200 ms 没消息就刹车 */
     if (s_ctrl.mode == DBG_MANUAL &&
         (uint32_t)(HAL_GetTick() - s_last_rc_ms) > RC_TIMEOUT_MS)
     {
-        if (s_ctrl.vx || s_ctrl.vy || s_ctrl.w_c) {
-            s_ctrl.vx = s_ctrl.vy = s_ctrl.w_c = 0;
+        if (s_ctrl.code != 0) {
+            s_ctrl.code = 0;                     /* 00 刹车 */
             s_ctrl.servo[1] = 0;                 /* 拨轮也停 */
             s_ctrl.servo_new |= 0x02;
             DebugLink_Log("RC TIMEOUT");
@@ -368,15 +356,18 @@ void DebugLink_SendTelem(const dbg_telem_t *t)
 
     char b[LINE_MAX];
     int n = snprintf(b, sizeof(b),
-        "T,%lu,%d,%d,%d,%d,%d,%u,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%d,%d,%d,%u",
+        "T,%lu,%d,%d,%d,%d,%u,%u,%u,%u,%d,"
+        "%u,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%u",
         (unsigned long)HAL_GetTick(),
-        t->v_lf, t->v_lb, t->v_rf, t->v_rb,
+        t->cnt_lf, t->cnt_lb, t->cnt_rf, t->cnt_rb,
+        (unsigned)t->duty[0], (unsigned)t->duty[1],
+        (unsigned)t->duty[2], (unsigned)t->duty[3],
         t->yaw_c,
         (unsigned)t->vis_class, t->vis_bear_c, (unsigned)t->vis_dist,
         (unsigned)t->vis_conf, (unsigned)t->vision_lost,
         (unsigned)t->tof[0], (unsigned)t->tof[1], (unsigned)t->tof[2],
         (unsigned)t->intake, (unsigned)t->state, (unsigned)t->n_col, (unsigned)fault,
-        t->cmd_vx, t->cmd_vy, t->cmd_w_c,
+        (unsigned)t->cmd_code,
         t->srv[0], t->srv[1], t->srv[2],
         (unsigned)s_ctrl.mode);
     if (n > 0) send_line(b, (uint16_t)n);
