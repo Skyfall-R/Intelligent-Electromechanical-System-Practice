@@ -1,0 +1,33 @@
+# ---- STM32CubeIDE 编译产物 ----
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+*.cyclo
+
+# ---- IDE 本地状态 ----
+.metadata/
+.settings/
+RemoteSystemsTempFiles/
+
+# ---- Python / OpenMV ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- 系统 / Office 临时文件 ----
+Thumbs.db
+.DS_Store
+~$*
+*.tmp
+
+# ---- 大文件别进仓库 ----
+*.pptx
+*.tar.gz
